@@ -1,0 +1,228 @@
+# DATMIG declarative transformation configuration — example
+#
+# Execution order within a table is FIXED and independent of the order rules
+# appear here:
+#   exclude -> rename -> null_handling -> string ops -> replace -> cast
+#   -> derived -> lookup -> validate
+#
+# Every rule supports `on_error`:
+#   fail        (default) - fail the chunk; the transaction rolls back
+#   reject_row            - write an authoritative reject record IN THE SAME
+#                           target transaction as the committed data (ADR-0019)
+#   null                  - set the target value to NULL (requires a nullable target)
+#   default: <value>      - substitute a literal
+#
+# DETERMINISM IS A CORRECTNESS REQUIREMENT, NOT A PREFERENCE.
+# Reject records are keyed (run, table, partition, chunk, reject_seq) where
+# reject_seq is assigned in extraction order. A replay of the same chunk must
+# therefore produce the SAME rows and the SAME rejects. The transform stage has
+# no access to the wall clock, randomness, the environment, or any mutable
+# external state; run-scoped values such as run_started_at and lookup tables are
+# frozen at run start and stored with the run. A custom transform that reads any
+# of those breaks invariant I4 and silently downgrades the run's SemanticsLevel.
+#
+# Transformations run in a pure stage with no database access by construction.
+
+version: 1
+
+defaults:
+  on_error: fail
+  trim_all_strings: false
+  empty_string_as_null: false
+
+tables:
+
+  - source: dbo.Customers
+    target: SALES.CUSTOMER            # table rename
+    enabled: true
+
+    exclude_columns:
+      - RowVersion                     # ROWVERSION: no meaning in Db2
+      - InternalScratchNotes
+      - FullNameComputed               # non-persisted computed column
+
+    columns:
+
+      - source: CustomerID
+        target: CUSTOMER_ID            # column rename only
+
+      - source: CustomerName
+        target: CUSTOMER_NAME
+        transforms:
+          - trim: both                 # both | left | right
+          - null_if_empty: true
+          - max_length:
+              length: 200
+              on_overflow: reject_row   # never silently truncate
+
+      - source: EmailAddress
+        target: EMAIL
+        transforms:
+          - lower: true
+          - trim: both
+          - replace:
+              pattern: '\s+'
+              replacement: ''
+              regex: true
+          - validate:
+              regex: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+              on_error: reject_row
+
+      - source: CountryCode
+        target: COUNTRY_CODE
+        transforms:
+          - upper: true
+          - lookup:
+              # Inline maps are loaded once per run and held in memory.
+              # For large maps use `source: file` with a CSV path.
+              map:
+                UK: GB
+                EIRE: IE
+                USA: US
+              default: passthrough      # passthrough | null | fail | <literal>
+
+      - source: CreditLimit
+        target: CREDIT_LIMIT
+        transforms:
+          - cast:
+              to: decimal
+              precision: 19
+              scale: 4
+              on_overflow: fail
+          - null_default: 0.0000        # applied only when the source value is NULL
+
+      - source: SignupDate
+        target: SIGNUP_DATE
+        transforms:
+          - date_convert:
+              from: datetime
+              to: date
+              on_error: reject_row
+
+      - source: LastLoginUtc
+        target: LAST_LOGIN_TS
+        transforms:
+          - date_convert:
+              from: datetimeoffset
+              to: timestamp
+              # Explicit. DATMIG never applies an implicit timezone shift.
+              normalize_to: utc
+              fractional_seconds: 3
+          # The type policy `datetimeoffset_strategy: utc_plus_offset_column`
+          # additionally generates LAST_LOGIN_TS_TZ_OFFSET_MIN automatically.
+
+      - source: IsActive
+        target: IS_ACTIVE
+        transforms:
+          - cast:
+              to: smallint              # BIT -> SMALLINT per bit_strategy
+
+      - source: AccountGuid
+        target: ACCOUNT_GUID
+        transforms:
+          - uuid_format:
+              case: upper
+              form: dashed              # dashed | compact
+
+    derived_columns:
+      - target: MIGRATED_AT
+        type: timestamp
+        expression:
+          function: run_started_at      # deterministic per run, not per row
+
+      - target: SOURCE_SYSTEM
+        type: varchar
+        length: 20
+        expression:
+          literal: SQLSERVER_PROD
+
+      - target: CUSTOMER_TIER
+        type: varchar
+        length: 10
+        expression:
+          case:
+            - when: "CREDIT_LIMIT >= 100000"
+              then: "PLATINUM"
+            - when: "CREDIT_LIMIT >= 10000"
+              then: "GOLD"
+            - else: "STANDARD"
+
+  - source: dbo.OrderLines
+    target: SALES.ORDER_LINE
+
+    columns:
+      - source: LineNotes
+        target: LINE_NOTES
+        transforms:
+          # Custom Python transform. Loaded from an allowlisted module path.
+          # Signature: (pa.Array, TransformContext) -> pa.Array
+          # No database handles are reachable from this stage.
+          - custom:
+              callable: datmig_custom.text:normalize_whitespace
+              output_type: string
+              on_error: reject_row
+
+      - source: Quantity
+        target: QUANTITY
+        transforms:
+          - numeric_convert:
+              to: integer
+              rounding: none            # none => non-integral values are an error
+              on_error: reject_row
+
+      - source: UnitPrice
+        target: UNIT_PRICE
+        transforms:
+          - numeric_convert:
+              to: decimal
+              precision: 19
+              scale: 4
+              rounding: half_even
+              on_error: fail
+
+    derived_columns:
+      - target: LINE_TOTAL
+        type: decimal
+        precision: 19
+        scale: 4
+        expression:
+          formula: "QUANTITY * UNIT_PRICE"
+
+# ---------------------------------------------------------------------------
+# REJECT HANDLING  (ADR-0019)
+#
+# Authoritative reject records are written to DATMIG_CTL.REJECT_RECORD in the
+# TARGET database, inside the same transaction as the data rows and the chunk
+# ledger row. The invariant is:
+#
+#   committed chunk  => its reject records exist
+#   rolled-back chunk => its reject records do not exist
+#
+# The control-plane copy is an asynchronous MIRROR, rebuilt from the target on
+# resume. It is never the source of truth and must never be configured as such.
+# ---------------------------------------------------------------------------
+rejects:
+  # Bound the transaction. A chunk that is mostly rejects is a mapping or policy
+  # error; failing loudly beats committing a pathological transaction.
+  max_reject_rows_per_chunk: 10_000
+  on_threshold_exceeded: fail_chunk
+
+  # Diagnostic capture. Truncating a diagnostic string is fine; truncating
+  # migrated data never is.
+  capture_rejected_value: true
+  rejected_value_max_chars: 4000
+  # Columns marked sensitive in the connection profile are OMITTED ENTIRELY -
+  # not masked in place - so this table cannot become an exfiltration path.
+  omit_sensitive_columns: true
+
+  mirror:
+    enabled: true
+    sink: control_db                   # control_db | jsonl
+    path: /var/datmig/quarantine
+    rebuild_from_target_on_resume: true
+
+  # A run with rejects cannot reach VALIDATED unless this is set with a
+  # threshold. Validation reconciles three independent numbers: summed ledger
+  # rejected_rows, the actual REJECT_RECORD count, and extracted - loaded.
+  allow_rejects: false
+  max_rejects_per_table: 0

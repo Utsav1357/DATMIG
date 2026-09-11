@@ -1,0 +1,221 @@
+# DATMIG migration definition — example
+# Credentials are NEVER present in this file. Only secret references.
+
+version: 1
+
+migration:
+  name: sales-prod-to-cp4d
+  description: "Sales database, SQL Server 2019 on-prem to Db2 in CP4D"
+
+source:
+  platform: sqlserver
+  environment: production
+  host: ${MSSQL_HOST}
+  port: 1433
+  database: SalesProd
+  auth:
+    method: sql_login              # sql_login | integrated | aad_token
+    username: ${MSSQL_USER}        # dedicated read-only account: db_datareader + VIEW DEFINITION
+    secret_ref: vault://kv/datmig/sqlserver#password
+  tls:
+    enabled: true                  # ODBC Driver 18 defaults Encrypt=yes
+    trust_server_certificate: false
+    ca_cert_path: /etc/datmig/certs/mssql-ca.pem
+  options:
+    application_name: DATMIG
+    connect_timeout_seconds: 15
+    query_timeout_seconds: 3600
+    max_concurrent_connections: 8  # protects the production source
+
+# ---------------------------------------------------------------------------
+# SOURCE CONSISTENCY  (see architecture 6A and ADR-0018)
+#
+# This block, not the isolation level, decides whether DATMIG can claim a
+# coherent point-in-time migration.
+#
+#   QUIESCED                  - no writers. Absolute guarantee. Needs a window.
+#   DATABASE_SNAPSHOT         - one database-wide point in time, shared by all
+#                               workers. DEFAULT. SQL Server 2016 SP1+ on
+#                               non-Enterprise editions. Costs copy-on-write I/O
+#                               on the source and sparse-file space proportional
+#                               to WRITE CHURN during the run.
+#   SNAPSHOT_TRANSACTION      - one point in time PER CONNECTION. SQL Server
+#                               cannot share a snapshot across sessions, so this
+#                               is NOT a parallel-safe substitute for the above.
+#   READ_COMMITTED_VERSIONED  - statement-level only. Thousands of points in
+#                               time. Requires allow_incoherent_source: true and
+#                               downgrades the run's SemanticsLevel.
+#   CDC_RECONCILED            - reserved; not implemented in V1.
+# ---------------------------------------------------------------------------
+source_consistency:
+  mode: DATABASE_SNAPSHOT
+  allow_incoherent_source: false
+
+  database_snapshot:
+    # Either DATMIG creates the snapshot (needs DATMIG_SNAPSHOT_ADMIN, which
+    # holds CREATE DATABASE), or the DBA creates it and you name it here.
+    create: true
+    name_template: "{source_database}_datmig_{run_id}"
+    file_path: "E:\\SQLSnapshots"
+    # Fail the run early rather than letting the snapshot become suspect.
+    max_sparse_file_bytes: 536_870_912_000     # 500 GB
+    warn_sparse_file_ratio: 0.7
+    drop_on_completion: true
+    orphan_scan_on_startup: true
+
+  # Applies only to SNAPSHOT_TRANSACTION.
+  snapshot_transaction:
+    max_transaction_seconds: 3600
+    force_single_worker: true                  # the only honest setting
+
+  # Refuse to resume with a point-in-time claim if the original read source is
+  # gone. Alternative: downgrade_and_continue (audited), or rerun_incomplete.
+  on_resume_without_original_snapshot: refuse
+
+target:
+  platform: db2
+  deployment: cp4d                 # on_prem | cp4d | db2_cloud
+  environment: production
+  host: ${DB2_HOST}                # supplied by the platform team; never derived
+  port: ${DB2_PORT}                # never assumed
+  database: ${DB2_DATABASE}
+  auth:
+    method: username_password      # confirm the mechanisms your deployment supports
+    username: ${DB2_USER}
+    secret_ref: vault://kv/datmig/db2#password
+  tls:
+    enabled: true
+    ca_cert_path: /etc/datmig/certs/db2-ca.pem
+    verify_server_certificate: true
+  options:
+    connect_timeout_seconds: 30
+    query_timeout_seconds: 3600
+    control_schema: DATMIG_CTL     # chunk ledger lives here
+    staging_schema: DATMIG_STG
+
+selection:
+  schemas: [dbo, sales]
+  include_tables:
+    - "dbo.Customers"
+    - "dbo.Orders"
+    - "dbo.OrderLines"
+    - "sales.*"
+  exclude_tables:
+    - "dbo.*_bak"
+    - "dbo.tmp_*"
+  schema_mapping:
+    dbo: SALES
+    sales: SALES
+
+type_policies:
+  bit_strategy: smallint
+  decimal_over_31: narrow_if_safe
+  time_fraction_strategy: timestamp_anchored
+  datetimeoffset_strategy: utc_plus_offset_column
+  uuid_strategy: char36
+  lob_strategy: downgrade_if_safe
+  lob_downgrade_margin: 2.0
+  rowversion_strategy: exclude
+  xml_strategy: clob
+  char_over_limit: varchar_padded
+
+  # Character sizing. SQL Server VARCHAR(n) is n BYTES even under a _UTF8
+  # collation, and NVARCHAR(n) is n UTF-16 CODE UNITS, not characters.
+  # See type-mapping-matrix.md section 2.
+  string_units: octets                 # octets | codeunits32
+  size_from_profile: true
+  profile_safety_margin: 1.5
+  sbcs_to_utf8_bound: 3
+  nvarchar_to_utf8_bound: 3
+
+  accept_potentially_lossy: false
+  accept_widening: true                # widening is safe, but always itemised
+
+execution:
+  memory_budget_bytes: 3_221_225_472    # 3 GiB total across workers
+  max_reject_rows_per_chunk: 10_000     # exceeded => the chunk FAILS, see ADR-0019
+  global_worker_limit: 8
+  default_chunk_bytes: 104_857_600      # ~100 MB
+  max_chunk_rows: 250_000
+  target_batch_rows: 20_000
+  load_strategy: direct_insert          # direct_insert | staged_insert | staged_merge
+  create_target_ddl: generate_only      # generate_only | generate_and_apply
+  post_load:
+    create_indexes: true
+    create_foreign_keys: true
+    reseed_identity: true
+    runstats: true
+
+partitioning:
+  auto: true
+  small_table_rows: 1_000_000
+  skew_threshold: 3.0
+  overrides:
+    "dbo.Orders":
+      strategy: date_range
+      column: OrderDate
+      interval: month
+    "dbo.AuditLog":
+      strategy: numeric_range
+      column: AuditID
+      chunk_rows: 500_000
+
+retries:
+  max_attempts_per_chunk: 5
+  max_attempts_per_partition: 20
+  base_delay_seconds: 1
+  max_delay_seconds: 60
+  jitter: full
+  max_consecutive_chunk_failures: 10
+
+validation:
+  default_level: STANDARD
+  digest:
+    tier1_algorithm: blake3            # blake3 | sha256 (use sha256 if FIPS applies)
+    tier2_algorithm: blake3_keyed_multiset_128
+    canonical_encoding_version: 1
+    # xxhash64 is a screening digest only and is never authoritative.
+  per_table:
+    "dbo.Orders": STRICT
+    "dbo.OrderLines": STRICT
+  sample_rows: 10_000
+  float_tolerance: 1e-9
+
+transformations:
+  file: ./transformations.example.yaml
+
+observability:
+  log_level: INFO
+  log_format: json
+  otel_endpoint: http://otel-collector:4317
+  metrics_port: 9090
+
+safety:
+  allow_destructive_on_production: false
+  require_confirmation_token: true      # must include the target database name
+  dry_run_required_before_first_run: true
+  allow_excess_privileges: false        # refuse to run as DBADM/sysadmin in prod
+
+# ---------------------------------------------------------------------------
+# ROLES  (see architecture 18.1 and ADR-0020)
+# The long-running runtime account holds DML only. Bootstrap objects are created
+# once, by a separate role, and staging tables are pre-created from the
+# deterministic plan so runtime never needs CREATETAB.
+# ---------------------------------------------------------------------------
+roles:
+  target_bootstrap:
+    username: ${DB2_BOOTSTRAP_USER}
+    secret_ref: vault://kv/datmig/db2-bootstrap#password
+    used_for: [create_control_schema, schema_migrations, create_target_ddl, create_staging]
+  target_runtime:
+    username: ${DB2_USER}
+    secret_ref: vault://kv/datmig/db2#password
+    assert_no_authorities: [DBADM, SECADM, DATAACCESS]
+  source_reader:
+    username: ${MSSQL_USER}
+    secret_ref: vault://kv/datmig/sqlserver#password
+  source_snapshot_admin:
+    # Omit entirely if the DBA creates the snapshot and you set
+    # source_consistency.database_snapshot.create: false
+    username: ${MSSQL_SNAPSHOT_USER}
+    secret_ref: vault://kv/datmig/sqlserver-snap#password
